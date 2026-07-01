@@ -1,275 +1,280 @@
-import { useEffect, useRef, useState } from "react";
-import { Button } from "./ui/button";
-import { Card } from "./ui/card";
-import { Play, Pause, RotateCcw, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-// Canonical units: distances in AU, time in years. GM_sun = 4π².
-const GM = 4 * Math.PI * Math.PI;
-
-type PlanetSpec = {
-  id: string;
-  name: string;
-  a: number;
-  color: string;
-  radiusPx: number;
+// ============================================================
+// CONFIGURACIÓN por defecto (Tierra alrededor del Sol).
+// Se puede editar en vivo desde la UI.
+// ============================================================
+const DEFAULTS = {
+  G: 6.6743e-11,          // Constante de Gravitación Universal [N·m²/kg²]
+  m_central: 1.989e30,    // Masa del cuerpo central [kg] — Sol
+  distancia_inicial: 1.496e11, // Distancia inicial [m] — 1 UA
+  v_inicial: 29780,       // Velocidad orbital perpendicular [m/s]
+  dt: 3600,               // Paso de integración [s] — 1 hora
+  pasos_totales: 8760,    // Iteraciones — ~1 año terrestre
 };
 
-const PLANETS: PlanetSpec[] = [
-  { id: "mercury", name: "Mercurio", a: 0.39, color: "#b1b1b1", radiusPx: 3 },
-  { id: "venus", name: "Venus", a: 0.72, color: "#e8c37a", radiusPx: 4 },
-  { id: "earth", name: "Tierra", a: 1.0, color: "#4f9dff", radiusPx: 4 },
-  { id: "mars", name: "Marte", a: 1.52, color: "#e06b4a", radiusPx: 4 },
-  { id: "jupiter", name: "Júpiter", a: 5.2, color: "#d9a066", radiusPx: 9 },
-  { id: "saturn", name: "Saturno", a: 9.58, color: "#e6d3a3", radiusPx: 8 },
-  { id: "uranus", name: "Urano", a: 19.2, color: "#8ed6e0", radiusPx: 6 },
-  { id: "neptune", name: "Neptuno", a: 30.05, color: "#4a6bd6", radiusPx: 6 },
-];
+type Config = typeof DEFAULTS;
 
-type Body = {
-  spec: PlanetSpec;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  trail: { x: number; y: number }[];
-};
+// Integración numérica: método de Euler explícito sobre la
+// Ley de Gravitación Universal de Newton (F = G·M·m / r²).
+// Trabajamos en 2D (plano XY): el cuerpo central está en el origen (0,0)
+// y el cuerpo que orbita empieza en (distancia_inicial, 0) con velocidad
+// perpendicular (0, v_inicial).
+function simulate(cfg: Config) {
+  const { G, m_central, distancia_inicial, v_inicial, dt, pasos_totales } = cfg;
 
-function makeBody(spec: PlanetSpec, angle = 0): Body {
-  const v = Math.sqrt(GM / spec.a);
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  return {
-    spec,
-    x: spec.a * cos,
-    y: spec.a * sin,
-    vx: -v * sin,
-    vy: v * cos,
-    trail: [],
-  };
+  let x = distancia_inicial, y = 0;   // posición inicial [m]
+  let vx = 0, vy = v_inicial;         // velocidad inicial [m/s]
+
+  const xs = new Float64Array(pasos_totales);
+  const ys = new Float64Array(pasos_totales);
+
+  let maxR = distancia_inicial;
+
+  for (let i = 0; i < pasos_totales; i++) {
+    // 1) Distancia actual al cuerpo central (origen).
+    const r = Math.sqrt(x * x + y * y);
+
+    // 2) Magnitud de la aceleración gravitatoria: a = G·M / r².
+    const a = (G * m_central) / (r * r);
+
+    // 3) Componentes vectoriales apuntando al origen (signo negativo).
+    const ax = -a * (x / r);
+    const ay = -a * (y / r);
+
+    // 4) Euler: v_f = v_0 + a·dt
+    vx += ax * dt;
+    vy += ay * dt;
+
+    // 5) Euler: r_f = r_0 + v·dt
+    x += vx * dt;
+    y += vy * dt;
+
+    xs[i] = x; ys[i] = y;
+    const rr = Math.sqrt(x * x + y * y);
+    if (rr > maxR) maxR = rr;
+  }
+
+  return { xs, ys, maxR };
 }
 
 export function OrbitSimulation() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const bodiesRef = useRef<Body[]>([]);
-  const runningRef = useRef(false);
+  const [cfg, setCfg] = useState<Config>(DEFAULTS);
   const [running, setRunning] = useState(false);
-  const [activeIds, setActiveIds] = useState<string[]>([]);
+  const [progress, setProgress] = useState(0); // índice actual dibujado
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef<number | null>(null);
 
-  const step = (dt: number) => {
-    for (const b of bodiesRef.current) {
-      const r2 = b.x * b.x + b.y * b.y;
-      const r = Math.sqrt(r2);
-      const a = -GM / r2;
-      b.vx += ((a * b.x) / r) * dt;
-      b.vy += ((a * b.y) / r) * dt;
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-      b.trail.push({ x: b.x, y: b.y });
-      if (b.trail.length > 2000) b.trail.shift();
-    }
-  };
+  // Recalcular la trayectoria completa cuando cambia la configuración.
+  const sim = useMemo(() => simulate(cfg), [cfg]);
 
-  const draw = () => {
+  // Animación: avanza el índice `progress` frame a frame mientras `running` sea true.
+  useEffect(() => {
+    if (!running) return;
+    const stepsPerFrame = Math.max(1, Math.floor(cfg.pasos_totales / 600));
+    const tick = () => {
+      setProgress(p => {
+        const next = p + stepsPerFrame;
+        if (next >= cfg.pasos_totales) {
+          setRunning(false);
+          return cfg.pasos_totales;
+        }
+        return next;
+      });
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
+  }, [running, cfg.pasos_totales]);
+
+  // Dibujar el gráfico 2D.
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const W = canvas.width;
-    const H = canvas.height;
-    ctx.fillStyle = "#05070f";
-    ctx.fillRect(0, 0, W, H);
 
-    ctx.fillStyle = "rgba(255,255,255,0.4)";
-    for (let i = 0; i < 80; i++) {
-      const sx = (i * 97) % W;
-      const sy = (i * 53) % H;
-      ctx.fillRect(sx, sy, 1, 1);
-    }
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
 
-    const bodies = bodiesRef.current;
-    const cx = W / 2;
-    const cy = H / 2;
-    const Rmax = Math.min(W, H) / 2 - 24;
-    const maxA = Math.max(1.5, ...bodies.map((b) => b.spec.a));
+    const cx = W / 2, cy = H / 2;
+    const margin = 50;
+    const scale = (Math.min(W, H) / 2 - margin) / sim.maxR;
 
-    // Log radial mapping — used when inner + outer planets coexist so the
-    // rocky worlds don't collapse into the Sun.
-    const mixed =
-      bodies.some((b) => b.spec.a > 3) && bodies.some((b) => b.spec.a < 3);
-    const a0 = 0.15;
-    const logDen = Math.log(1 + maxA / a0);
-    const mapR = (r: number) =>
-      mixed ? (Rmax * Math.log(1 + r / a0)) / logDen : (r / (maxA * 1.15)) * Rmax;
-
-    const project = (x: number, y: number) => {
-      const r = Math.hypot(x, y);
-      if (r < 1e-9) return { px: cx, py: cy };
-      const rd = mapR(r);
-      return { px: cx + (x / r) * rd, py: cy - (y / r) * rd };
-    };
-
-    // Orbit guides
-    ctx.strokeStyle = "rgba(255,255,255,0.1)";
+    // Ejes X e Y con etiquetas dinámicas basadas en la escala real.
+    ctx.strokeStyle = "#334155";
     ctx.lineWidth = 1;
-    for (const b of bodies) {
-      ctx.beginPath();
-      ctx.arc(cx, cy, mapR(b.spec.a), 0, Math.PI * 2);
-      ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(margin / 2, cy); ctx.lineTo(W - margin / 2, cy);
+    ctx.moveTo(cx, margin / 2); ctx.lineTo(cx, H - margin / 2);
+    ctx.stroke();
+
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "12px ui-sans-serif, system-ui";
+    ctx.fillText(`X [m]  (~${sim.maxR.toExponential(1)})`, W - 140, cy - 6);
+    ctx.fillText(`Y [m]`, cx + 6, margin / 2 + 10);
+
+    // Marcas en los ejes cada r_max/2.
+    ctx.strokeStyle = "#1e293b";
+    for (const frac of [-1, -0.5, 0.5, 1]) {
+      const px = cx + frac * sim.maxR * scale;
+      const py = cy - frac * sim.maxR * scale;
+      ctx.beginPath(); ctx.moveTo(px, cy - 4); ctx.lineTo(px, cy + 4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx - 4, py); ctx.lineTo(cx + 4, py); ctx.stroke();
+      ctx.fillStyle = "#64748b";
+      ctx.fillText(`${(frac * sim.maxR).toExponential(1)}`, px + 3, cy + 14);
     }
 
-    const sunCore = mixed ? 6 : 10;
-    const sunGlow = mixed ? 14 : 26;
-    const sunGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, sunGlow);
-    sunGrad.addColorStop(0, "#fff2b0");
-    sunGrad.addColorStop(0.3, "#ffcf4a");
-    sunGrad.addColorStop(1, "rgba(255,140,0,0)");
-    ctx.fillStyle = sunGrad;
+    // Trayectoria orbital ya recorrida.
+    const upto = Math.min(progress, sim.xs.length);
+    ctx.strokeStyle = "#93c5fd";
+    ctx.lineWidth = 1.4;
     ctx.beginPath();
-    ctx.arc(cx, cy, sunGlow, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = "#fff5c2";
-    ctx.beginPath();
-    ctx.arc(cx, cy, sunCore, 0, Math.PI * 2);
-    ctx.fill();
-
-    for (const b of bodies) {
-      ctx.strokeStyle = b.spec.color + "aa";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      for (let i = 0; i < b.trail.length; i++) {
-        const { px, py } = project(b.trail[i].x, b.trail[i].y);
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      ctx.stroke();
-
-      const { px, py } = project(b.x, b.y);
-      ctx.fillStyle = b.spec.color;
-      ctx.beginPath();
-      ctx.arc(px, py, Math.max(3, b.spec.radiusPx), 0, Math.PI * 2);
-      ctx.fill();
+    for (let i = 0; i < upto; i++) {
+      const sx = cx + sim.xs[i] * scale;
+      const sy = cy - sim.ys[i] * scale; // invertimos Y (pantalla ↓ es negativo)
+      if (i === 0) ctx.moveTo(sx, sy);
+      else ctx.lineTo(sx, sy);
     }
-  };
+    ctx.stroke();
 
-  useEffect(() => {
-    let raf = 0;
-    let last = performance.now();
-    const loop = (t: number) => {
-      const elapsed = Math.min(0.05, (t - last) / 1000);
-      last = t;
-      if (runningRef.current) {
-        const bodies = bodiesRef.current;
-        const minA = bodies.length
-          ? Math.min(...bodies.map((b) => b.spec.a))
-          : 1;
-        const speed = 0.15 * Math.pow(minA, 1.5);
-        const simTime = elapsed * speed;
-        const substeps = 400;
-        const dt = simTime / substeps;
-        for (let i = 0; i < substeps; i++) step(dt);
-      }
-      draw();
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, []);
+    // Cuerpo central en el origen (halo amarillo).
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 26);
+    grad.addColorStop(0, "rgba(253,224,71,1)");
+    grad.addColorStop(1, "rgba(253,224,71,0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(cx, cy, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#facc15";
+    ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill();
 
-  const addPlanet = (spec: PlanetSpec) => {
-    if (bodiesRef.current.some((b) => b.spec.id === spec.id)) return;
-    bodiesRef.current = [
-      ...bodiesRef.current,
-      makeBody(spec, Math.random() * Math.PI * 2),
-    ];
-    setActiveIds((ids) => [...ids, spec.id]);
-  };
+    // Posición inicial (verde).
+    const sx0 = cx + sim.xs[0] * scale;
+    const sy0 = cy - sim.ys[0] * scale;
+    ctx.fillStyle = "#22c55e";
+    ctx.beginPath(); ctx.arc(sx0, sy0, 4, 0, Math.PI * 2); ctx.fill();
 
-  const addAll = () => {
-    bodiesRef.current = PLANETS.map((p, i) =>
-      makeBody(p, (i / PLANETS.length) * Math.PI * 2)
-    );
-    setActiveIds(PLANETS.map((p) => p.id));
-  };
+    // Cuerpo en órbita en la posición actual (azul).
+    if (upto > 0) {
+      const i = upto - 1;
+      const sx = cx + sim.xs[i] * scale;
+      const sy = cy - sim.ys[i] * scale;
+      ctx.fillStyle = "#60a5fa";
+      ctx.beginPath(); ctx.arc(sx, sy, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "rgba(96,165,250,0.5)";
+      ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI * 2); ctx.stroke();
+    }
+  }, [sim, progress]);
 
-  const reset = () => {
-    bodiesRef.current = [];
-    setActiveIds([]);
+  const tiempoTotalDias = (cfg.dt * cfg.pasos_totales) / 86400;
+  const vCircular = Math.sqrt((cfg.G * cfg.m_central) / cfg.distancia_inicial);
+  const tiempoActualDias = (cfg.dt * progress) / 86400;
+
+  const setField = (k: keyof Config) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = parseFloat(e.target.value);
+    if (!Number.isFinite(v)) return;
+    setCfg(c => ({ ...c, [k]: v }));
     setRunning(false);
-    runningRef.current = false;
+    setProgress(0);
   };
 
-  const toggleRun = () => {
-    const next = !runningRef.current;
-    runningRef.current = next;
-    setRunning(next);
+  const handleStart = () => {
+    if (progress >= cfg.pasos_totales) setProgress(0);
+    setRunning(true);
   };
+  const handlePause = () => setRunning(false);
+  const handleReset = () => { setRunning(false); setProgress(0); };
 
   return (
-    <Card className="w-full max-w-6xl bg-slate-900/80 border-slate-800 p-6 flex flex-col gap-6">
-      <div className="flex items-center justify-between flex-wrap gap-3">
+    <div className="w-full max-w-6xl grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
+      <div className="bg-slate-900/60 rounded-lg p-5 border border-slate-800 space-y-4">
         <div>
-          <h1 className="text-slate-100">Simulador del Sistema Solar</h1>
-          <p className="text-slate-400">
-            Integración newtoniana · escala radial logarítmica cuando se mezclan
-            planetas internos y externos
+          <div className="text-xs uppercase tracking-wider text-slate-400">Simulación</div>
+          <h1 className="text-white">Órbita gravitacional (Euler)</h1>
+          <p className="text-sm text-slate-400 mt-1">
+            Ley de Newton F = G·M·m / r², integrada paso a paso en 2D.
           </p>
         </div>
-        <div className="flex gap-2">
-          <Button onClick={toggleRun} disabled={activeIds.length === 0}>
-            {running ? <Pause className="size-4" /> : <Play className="size-4" />}
-            {running ? "Pausar" : "Iniciar"}
-          </Button>
-          <Button variant="secondary" onClick={reset}>
-            <RotateCcw className="size-4" />
+
+        {[
+          { k: "G", label: "G [N·m²/kg²]", step: "1e-12" },
+          { k: "m_central", label: "Masa central [kg]", step: "any" },
+          { k: "distancia_inicial", label: "Distancia inicial [m]", step: "any" },
+          { k: "v_inicial", label: "Velocidad inicial ⊥ [m/s]", step: "any" },
+          { k: "dt", label: "Paso dt [s]", step: "any" },
+          { k: "pasos_totales", label: "Pasos totales", step: "1" },
+        ].map(({ k, label, step }) => (
+          <label key={k} className="block">
+            <span className="text-xs text-slate-300">{label}</span>
+            <input
+              type="number"
+              step={step}
+              value={cfg[k as keyof Config]}
+              onChange={setField(k as keyof Config)}
+              className="mt-1 w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-sm text-slate-100 outline-none focus:border-blue-500"
+            />
+          </label>
+        ))}
+
+        <div className="flex gap-2 pt-2">
+          {!running ? (
+            <button
+              onClick={handleStart}
+              className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-sm py-2 rounded transition"
+            >
+              {progress > 0 && progress < cfg.pasos_totales ? "Continuar" : "Iniciar"}
+            </button>
+          ) : (
+            <button
+              onClick={handlePause}
+              className="flex-1 bg-amber-600 hover:bg-amber-500 text-white text-sm py-2 rounded transition"
+            >
+              Pausar
+            </button>
+          )}
+          <button
+            onClick={handleReset}
+            className="flex-1 bg-slate-700 hover:bg-slate-600 text-white text-sm py-2 rounded transition"
+          >
             Reiniciar
-          </Button>
+          </button>
+        </div>
+
+        <button
+          onClick={() => { setCfg(DEFAULTS); setProgress(0); setRunning(false); }}
+          className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs py-2 rounded transition"
+        >
+          Restablecer valores (Tierra–Sol)
+        </button>
+
+        <div className="text-xs text-slate-400 space-y-1 pt-2 border-t border-slate-800">
+          <div>Tiempo simulado ≈ <span className="text-slate-200">{tiempoTotalDias.toFixed(1)} días</span></div>
+          <div>Tiempo actual: <span className="text-slate-200">{tiempoActualDias.toFixed(1)} días</span></div>
+          <div>v circular teórica: <span className="text-slate-200">{vCircular.toFixed(0)} m/s</span></div>
+          <div>r máx: <span className="text-slate-200">{sim.maxR.toExponential(2)} m</span></div>
+          <div>Progreso: <span className="text-slate-200">{progress}/{cfg.pasos_totales}</span></div>
         </div>
       </div>
 
-      <div className="grid md:grid-cols-[1fr_260px] gap-6">
-        <div className="rounded-lg overflow-hidden border border-slate-800 bg-black">
-          <canvas
-            ref={canvasRef}
-            width={800}
-            height={640}
-            className="w-full h-auto block"
-          />
+      <div className="bg-slate-900/60 rounded-lg border border-slate-800 overflow-hidden flex flex-col">
+        <div className="px-4 py-2 border-b border-slate-800 flex items-center justify-between text-xs text-slate-400">
+          <span>Trayectoria 2D (plano XY)</span>
+          <span className="flex gap-3">
+            <span><span className="inline-block w-2 h-2 rounded-full bg-yellow-400 mr-1" />cuerpo central</span>
+            <span><span className="inline-block w-2 h-2 rounded-full bg-green-500 mr-1" />inicio</span>
+            <span><span className="inline-block w-2 h-2 rounded-full bg-blue-400 mr-1" />posición actual</span>
+          </span>
         </div>
-
-        <div className="flex flex-col gap-3">
-          <Button onClick={addAll} className="bg-indigo-600 hover:bg-indigo-500">
-            <Sparkles className="size-4" />
-            Agregar todos
-          </Button>
-
-          <div className="flex flex-col gap-2 mt-2">
-            {PLANETS.map((p) => {
-              const active = activeIds.includes(p.id);
-              return (
-                <button
-                  key={p.id}
-                  onClick={() => addPlanet(p)}
-                  disabled={active}
-                  className={`flex items-center justify-between px-3 py-2 rounded-md border transition ${
-                    active
-                      ? "bg-slate-800/40 border-slate-800 text-slate-500 cursor-not-allowed"
-                      : "bg-slate-800 border-slate-700 hover:border-slate-500 text-slate-100"
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <span
-                      className="inline-block rounded-full"
-                      style={{ background: p.color, width: 12, height: 12 }}
-                    />
-                    {p.name}
-                  </span>
-                  <span className="text-slate-400">{p.a} AU</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        <canvas
+          ref={canvasRef}
+          className="w-full flex-1"
+          style={{ minHeight: 520 }}
+        />
       </div>
-    </Card>
+    </div>
   );
 }
